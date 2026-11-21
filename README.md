@@ -1,15 +1,16 @@
 # Blast Radius entry
 
 Picks, for each sqlglot patch, only the tests that can reach the changed code, then packs them onto
-workers to minimise `busiest worker + 2 s/worker`. Sample set: **127.4 s simulated, 0 misses** (v1 without the probe: 165.6 s;
-starter: 1210.5 s; oracle: 94.4 s). CPU ≈ 8.5 s for the batch, almost all of it the probe.
+workers to minimise `busiest worker + 2 s/worker`. Sample set: **118.2 s simulated, 0 misses** (v2: 127.4 s; v1: 165.6 s; starter: 1210.5 s;
+oracle: 94.4 s). CPU is mostly the local test runs, about 1 s each.
 
 ## Layout
 
 | Path | What |
 | --- | --- |
 | `selector.py` | The program the image runs. |
-| `probe_runner.py`, `probe_runner_lib.py` | Runs a few sqlglot tests in-process against a patched copy. |
+| `probe_runner.py`, `probe_runner_lib.py` | Runs sqlglot tests in-process against a patched copy. |
+| `probe_server.py` | Warm process (duckdb/pandas imported once) that forks a clean child per probe. |
 | `maps/maps.json.gz` | Maps built from sqlglot's own tests at eb11aec: per-line coverage, class users, files each test reads, imports, attribute readers. |
 | `src/` | Pinned sqlglot `.py` sources and test fixtures (MIT, see `src/LICENSE-sqlglot`), so each patch's files can be rebuilt and AST-diffed. |
 | `build/build_maps.sh` | Rebuilds `maps/` and `src/` from scratch (~6 min, 2 cores). Never run in the Docker build. |
@@ -49,4 +50,8 @@ BR_DATA=sample BR_SRC=src python3 selector.py > out.jsonl && python3 score.py sa
    cheapest candidate tests (≈2 s of measured CPU) against the patched code in /tmp, stopping at the first
    failure. Any failure, crash or timeout keeps the heavy tests; a clean pass drops them. Cheap tests are
    always kept. On 37 offline mutants in code TPC-DS covers, every heavy failure (13) came with a probe failure.
-6. Schedule: LPT for k = 1..8, keep the cheapest `max load + 2 s·k`.
+6. Exact runs: for a Python-only change whose candidates are all cheap (estimated CPU × 1.5 below 60% of
+   their schedule cost), run them all here and select only the ones that fail (often nothing). Untrusted
+   runs (crash, timeout, unexpected output) keep the full selection. Validated against real pytest on 71
+   mutants / 410 test outcomes: identical.
+7. Schedule: LPT for k = 1..8, keep the cheapest `max load + 2 s·k`.

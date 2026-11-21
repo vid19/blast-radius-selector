@@ -756,45 +756,144 @@ PROBE_MIN_SAVING_MS = int(os.environ.get("BR_PROBE_MIN_SAVING_MS", "6000"))
 PROBE_TIMEOUT = float(os.environ.get("BR_PROBE_TIMEOUT", "30"))
 PROBE_WALL_BUDGET = float(os.environ.get("BR_PROBE_WALL", "100"))
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_runner.py")
-_t0 = None
+SERVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_server.py")
+_server = None
 
 
-def run_probe(changed, test_ids):
-    """Runs test_ids against the patched sources; True if any fails (or the run misbehaves)."""
-    import shutil
+def _probe_env():
+    return {"PATH": os.environ.get("PATH", ""), "HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1", "SKIP_INTEGRATION": "0"}
+
+
+def probe_request(root, ids, run_all):
+    """Failing ids from running `ids` against `root`, or None if the run can't be trusted."""
     import subprocess
+    global _server
+    if _server is not None or os.environ.get("BR_PROBE_SERVER", "1") == "1":
+        try:
+            if _server is None:
+                _server = subprocess.Popen([sys.executable, SERVER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                           stderr=subprocess.DEVNULL, text=True, env=_probe_env(), cwd="/tmp")
+            _server.stdin.write(json.dumps({"root": root, "src": SRC, "ids": ids, "all": run_all, "timeout": PROBE_TIMEOUT}) + "\n")
+            _server.stdin.flush()
+            line = _server.stdout.readline()
+            if not line:
+                raise RuntimeError("probe server died")
+            reply = json.loads(line)
+            if "failed" not in reply:
+                log("probe", reply.get("error"))
+                return None
+            return reply["failed"]
+        except Exception as e:  # noqa
+            log("probe server", type(e).__name__, e)
+            try:
+                _server.kill()
+            except Exception:  # noqa
+                pass
+            _server = False  # don't retry the server; fall through to one-shot runs
+    try:
+        r = subprocess.run([sys.executable, RUNNER, root, SRC] + (["--all"] if run_all else []), input=json.dumps(ids),
+                           capture_output=True, text=True, timeout=PROBE_TIMEOUT, env=_probe_env(), cwd="/tmp")
+        if r.returncode != 0:
+            return None
+        return json.loads(r.stdout or "[]")
+    except Exception as e:  # noqa
+        log("probe", type(e).__name__)
+        return None
+
+
+def patched_root(changed):
+    import shutil
     root = "/tmp/br_import"
     if not os.path.isdir(os.path.join(root, "sqlglot")):
         shutil.rmtree(root, ignore_errors=True)
         shutil.copytree(os.path.join(SRC, "sqlglot"), os.path.join(root, "sqlglot"))
+    for path, text in changed.items():
+        with open(os.path.join(root, path), "w", encoding="utf-8") as fh:
+            fh.write(text)
+    return root
+
+
+def restore_root(changed):
+    import shutil
+    root = "/tmp/br_import"
+    for path in changed:
+        src = os.path.join(SRC, path)
+        dst = os.path.join(root, path)
+        if os.path.exists(src):
+            shutil.copyfile(src, dst)
+        elif os.path.exists(dst):
+            os.remove(dst)
+_t0 = None
+
+
+def run_probe(changed, test_ids):
+    """True if any test fails (or the run misbehaves): the change is live."""
     try:
-        for path, text in changed.items():
-            with open(os.path.join(root, path), "w", encoding="utf-8") as fh:
-                fh.write(text)
-        env = {"PATH": os.environ.get("PATH", ""), "HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1", "SKIP_INTEGRATION": "0"}
-        import resource
-        c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
-        r = subprocess.run([sys.executable, RUNNER, root, SRC], input=json.dumps(test_ids), capture_output=True,
-                           text=True, timeout=PROBE_TIMEOUT, env=env, cwd="/tmp")
-        c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
-        log("probe cpu", round(c1.ru_utime - c0.ru_utime + c1.ru_stime - c0.ru_stime, 2), "out", r.stdout.strip()[:120])
-        if r.returncode != 0:
-            log("probe crashed", r.stderr[-300:])
-            return True
-        return bool(json.loads(r.stdout or "[]"))
-    except Exception as e:  # timeouts count as failures: the change is live
-        log("probe", type(e).__name__)
-        return True
+        failed = probe_request(patched_root(changed), test_ids, False)
     finally:
-        for path in changed:
-            src = os.path.join(SRC, path)
-            dst = os.path.join(root, path)
-            if os.path.exists(src):
-                shutil.copyfile(src, dst)
+        restore_root(changed)
+    return failed is None or bool(failed)
 
 
 REPORT = {} if os.environ.get("BR_PROBE_REPORT") else None
-PROBE_BASE_MS = 700  # interpreter + sqlglot + duckdb/pandas imports
+PROBE_BASE_MS = 350  # interpreter + sqlglot
+HEAVY_LIB_MS = 400   # duckdb + pandas, pulled in by these test modules
+HEAVY_LIB_MODULES = ("tests/test_executor.py", "tests/test_optimizer.py")
+EXACT = os.environ.get("BR_EXACT", "1") == "1"
+EXACT_CPU_SCALE = float(os.environ.get("BR_EXACT_SCALE", "1.5"))   # scorer CPU vs measured cost model
+EXACT_MAX_FRACTION = float(os.environ.get("BR_EXACT_FRACTION", "0.6"))
+
+
+def probe_estimate(tids, maps):
+    pc = maps.probe_cost
+    c, sc, sm = PROBE_BASE_MS, set(), set()
+    for tid in tids:
+        if tid not in pc["test"]:
+            return None
+        cls, mod = tid.rsplit("::", 1)[0], tid.split("::")[0]
+        c += pc["test"][tid]
+        if cls not in sc:
+            c += pc["class"].get(cls, 0)
+            sc.add(cls)
+        if mod not in sm:
+            c += pc["module"].get(mod, 0)
+            sm.add(mod)
+    if any(m in sm for m in HEAVY_LIB_MODULES) and "tests/test_executor.py" not in sm:
+        c += HEAVY_LIB_MS
+    return c
+
+
+def run_probe_all(changed, test_ids):
+    """Runs every test; returns the failing ids, or None if the run can't be trusted."""
+    try:
+        failed = probe_request(patched_root(changed), test_ids, True)
+    finally:
+        restore_root(changed)
+    if failed is None or any(f not in test_ids for f in failed):
+        return None
+    return set(failed)
+
+
+def maybe_exact(sel, ms, an, maps, notes):
+    """Small candidate sets on Python-only changes: run them all here and keep only the failures."""
+    import time
+    if not EXACT or not sel or not an.changed_py or an.other_change:
+        return sel
+    if any(ms[t] >= HEAVY_MS for t in sel):
+        return sel
+    if time.time() - _t0 > PROBE_WALL_BUDGET:
+        return sel
+    ids = [maps.id_of[t] for t in sorted(sel)]
+    est = probe_estimate(ids, maps)
+    cur = schedule(sel, ms)[1]
+    if est is None or est * EXACT_CPU_SCALE > cur * EXACT_MAX_FRACTION:
+        return sel
+    failed = run_probe_all(an.changed_py, ids)
+    if failed is None:
+        notes.append("exact-untrusted")
+        return sel
+    notes.append(f"exact:{len(failed)}/{len(ids)}")
+    return {maps.by_id[f] for f in failed}
 
 
 def pick_probe(cands, maps):
@@ -918,12 +1017,19 @@ def main():
         if not any(n.startswith("error") for n in notes):
             try:
                 sel = maybe_drop_heavy(sel, ms, an, maps, notes)
+                sel = maybe_exact(sel, ms, an, maps, notes)
             except Exception as e:  # noqa
                 log("probe error", e)
         bins, cost = schedule(sel, ms)
         total += cost
         log(cid, len(sel), cost / 1000, notes[:6])
         print(json.dumps({"commit": cid, "workers": bins}, separators=(",", ":")))
+    if _server:
+        try:
+            _server.stdin.close()
+            _server.wait(timeout=10)
+        except Exception:  # noqa
+            _server.kill()
     log("simulated selection cost", total / 1000)
     if REPORT is not None:
         with open(os.environ["BR_PROBE_REPORT"], "w") as fh:

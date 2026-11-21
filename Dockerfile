@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir -r /app/requirements.lock
 
 # Pinned sqlglot sources and test fixtures (eb11aec, MIT) are vendored in src/. Maps in maps/
 # were built from sqlglot's own tests at eb11aec (see build/). Nothing else is downloaded.
-COPY selector.py probe_runner.py probe_runner_lib.py /app/
+COPY selector.py probe_runner.py probe_runner_lib.py probe_server.py /app/
 COPY maps /app/maps
 COPY src /app/src
 RUN python -m compileall -q /app/src /app/probe_runner_lib.py && chmod -R a+rX /app
