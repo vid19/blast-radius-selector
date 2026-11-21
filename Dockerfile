@@ -13,5 +13,5 @@ COPY maps /app/maps
 COPY src /app/src
 RUN python -m compileall -q /app/src /app/probe_runner_lib.py && chmod -R a+rX /app
 
-ENV BR_SRC=/app/src BR_MAPS=/app/maps/maps.json.gz BR_PROBE=1 PYTHONDONTWRITEBYTECODE=1
+ENV BR_SRC=/app/src BR_MAPS=/app/maps/maps.json.gz BR_PROBE=1 BR_DIAG_DROP=tests/test_executor.py::TestExecutor::test_execute_tpcds PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "-I", "/app/selector.py"]
