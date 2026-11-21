@@ -1091,6 +1091,50 @@ def genmem_stage(sel, ms, an, maps, notes):
     return sel
 
 
+FP_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpcds_fingerprint.py")
+FP_BASELINE = os.environ.get("BR_TPCDS_FP", os.path.join(os.path.dirname(os.path.abspath(MAPS)), "tpcds_fp.txt"))
+FP_STAGE = os.environ.get("BR_TPCDS_FP_STAGE", "1") == "1"
+# files whose only influence on the executor's TPC-DS test goes through what the fingerprint records
+# (DuckDB SQL, optimized query, logical plan); executor runtime code and runtime helpers are excluded
+FP_FILES = ("sqlglot/generators/duckdb.py", "sqlglot/dialects/duckdb.py", "sqlglot/parsers/duckdb.py",
+            "sqlglot/typing/duckdb.py", "sqlglot/planner.py")
+
+
+def _fp_file_ok(path):
+    if path in FP_FILES:
+        return True
+    return path.startswith("sqlglot/optimizer/") and path != "sqlglot/optimizer/scope.py"
+
+
+def tpcds_fingerprint_stage(sel, ms, an, maps, notes):
+    """Drop the executor's TPC-DS test when everything it derives from sqlglot for the queries it runs
+    (DuckDB SQL, optimized query, logical plan) is unchanged and the change is confined to code whose
+    only influence on that test is through those outputs."""
+    import subprocess
+    ex = maps.by_id.get(EX_TPCDS)
+    if not FP_STAGE or ex not in sel or not an.changed_py or an.other_change:
+        return sel
+    if not all(_fp_file_ok(p) for p in an.changed_py) or not os.path.exists(FP_BASELINE):
+        return sel
+    if schedule(sel, ms)[1] - schedule(sel - {ex}, ms)[1] < PROBE_MIN_SAVING_MS:
+        return sel
+    try:
+        root = patched_root(an.changed_py)
+        r = subprocess.run([sys.executable, FP_SCRIPT, root, SRC, FP_BASELINE], capture_output=True, text=True,
+                           timeout=PROBE_TIMEOUT, env=_probe_env(), cwd="/tmp")
+        same = r.returncode == 0
+    except Exception as e:  # noqa
+        log("tpcds fingerprint", type(e).__name__)
+        same = False
+    finally:
+        restore_root(an.changed_py)
+    if same:
+        notes.append("tpcds-fp-same")
+        return sel - {ex}
+    notes.append("tpcds-fp-changed")
+    return sel
+
+
 def maybe_drop_heavy(sel, ms, an, maps, notes):
     import time
     heavy = {t for t in sel if ms[t] >= HEAVY_MS}
@@ -1189,11 +1233,14 @@ def main():
                 sel = max_nodes_stage(sel, ms, an, maps, notes)
                 sel = genmem_stage(sel, ms, an, maps, notes)
                 sel = maybe_drop_heavy(sel, ms, an, maps, notes)
+                sel = tpcds_fingerprint_stage(sel, ms, an, maps, notes)
                 sel = maybe_exact(sel, ms, an, maps, notes)
             except Exception as e:  # noqa
                 log("probe error", e)
         if os.environ.get("BR_DIAG_DROP_HEAVY") == "1":  # diagnostic only: never select slow tests
             sel = {t for t in sel if ms[t] < HEAVY_MS}
+        for tid in filter(None, os.environ.get("BR_DIAG_DROP", "").split(",")):  # diagnostic only
+            sel.discard(maps.by_id.get(tid))
         bins, cost = schedule(sel, ms)
         total += cost
         log(cid, len(sel), cost / 1000, notes[:6])
