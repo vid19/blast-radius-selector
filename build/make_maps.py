@@ -184,3 +184,12 @@ out["derived"] = sorted(derived)
 raw = json.dumps(out, separators=(",", ":")).encode()
 gzip.open(sys.argv[2], "wb", 9).write(raw)
 print("with name refs: sets", len(sets), "raw MB", len(raw) / 1e6, "derived", len(derived), "names", len(refs))
+
+# ---- measured inline CPU of each test for the probe (build/probe_costs.py)
+pc_path = RAW + "probe_costs.json"
+if os.path.exists(pc_path):
+    pc = json.load(open(pc_path))
+    out["probe_cost"] = pc
+    raw = json.dumps(out, separators=(",", ":")).encode()
+    gzip.open(sys.argv[2], "wb", 9).write(raw)
+    print("with probe costs", len(raw) / 1e6)

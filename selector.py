@@ -17,7 +17,7 @@ import sys
 from difflib import SequenceMatcher
 
 DATA = os.environ.get("BR_DATA", "/data")
-SRC = os.environ.get("BR_SRC", "/opt/sqlglot")
+SRC = os.path.abspath(os.environ.get("BR_SRC", "/opt/sqlglot"))
 MAPS = os.environ.get("BR_MAPS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "maps.json.gz"))
 WORKER_MS = 2000
 MAX_WORKERS = 8
@@ -168,6 +168,7 @@ class Maps:
         self.mod_users = m["mod_users"]
         self.mod_runtime = m["mod_runtime"]
         self.static_importers = m["static_importers"]
+        self.probe_cost = m.get("probe_cost", {"test": {}, "class": {}, "module": {}})
         self.name_refs = m.get("name_refs", {})
         self.derived = set(m.get("derived", ()))
         self.mapped = set(x for x in remap if x is not None)
@@ -177,6 +178,7 @@ class Maps:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
             self.by_class.setdefault(t["id"].rsplit("::", 1)[0], set()).add(t["number"])
         self.by_id = num
+        self.id_of = {v: k for k, v in num.items()}
         self.everything = set(num.values())
 
     def cov(self, path, lines):
@@ -436,6 +438,8 @@ class Analyzer:
         self.tests = tests
         self.trees = {}
         self.pending = {}
+        self.changed_py = {}
+        self.other_change = False
         self.ref_index = None
 
     def old_tree(self, path):
@@ -712,6 +716,10 @@ class Analyzer:
             if old_path.endswith(".py") and old_path.startswith("sqlglot/"):
                 out |= self.import_failure(old_path)
         path = old_path or new_path
+        if not (path.endswith(".py") and path.startswith("sqlglot/")) or old_path is None or new_path is None or old_path != new_path:
+            self.other_change = True
+        elif new_text is not None:
+            self.changed_py[path] = new_text
         if path.endswith(".py") and path.startswith("sqlglot/"):
             if old_path is None:
                 notes.append("new-module")
@@ -736,6 +744,109 @@ class Analyzer:
         if out:
             notes.append(f"opened-by:{len(out)}")
         return out
+
+
+# --------------------------------------------------------------------------- probe
+
+PROBE = os.environ.get("BR_PROBE", "0") == "1"
+HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "3000"))        # tests this slow are worth probing for
+PROBE_BUDGET_MS = int(os.environ.get("BR_PROBE_BUDGET_MS", "2000"))  # measured probe CPU (ms) to spend
+PROBE_MIN_TESTS = int(os.environ.get("BR_PROBE_MIN_TESTS", "3"))
+PROBE_MIN_SAVING_MS = int(os.environ.get("BR_PROBE_MIN_SAVING_MS", "6000"))
+PROBE_TIMEOUT = float(os.environ.get("BR_PROBE_TIMEOUT", "30"))
+PROBE_WALL_BUDGET = float(os.environ.get("BR_PROBE_WALL", "100"))
+RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_runner.py")
+_t0 = None
+
+
+def run_probe(changed, test_ids):
+    """Runs test_ids against the patched sources; True if any fails (or the run misbehaves)."""
+    import shutil
+    import subprocess
+    root = "/tmp/br_import"
+    if not os.path.isdir(os.path.join(root, "sqlglot")):
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.copytree(os.path.join(SRC, "sqlglot"), os.path.join(root, "sqlglot"))
+    try:
+        for path, text in changed.items():
+            with open(os.path.join(root, path), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1", "SKIP_INTEGRATION": "0"}
+        import resource
+        c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        r = subprocess.run([sys.executable, RUNNER, root, SRC], input=json.dumps(test_ids), capture_output=True,
+                           text=True, timeout=PROBE_TIMEOUT, env=env, cwd="/tmp")
+        c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        log("probe cpu", round(c1.ru_utime - c0.ru_utime + c1.ru_stime - c0.ru_stime, 2), "out", r.stdout.strip()[:120])
+        if r.returncode != 0:
+            log("probe crashed", r.stderr[-300:])
+            return True
+        return bool(json.loads(r.stdout or "[]"))
+    except Exception as e:  # timeouts count as failures: the change is live
+        log("probe", type(e).__name__)
+        return True
+    finally:
+        for path in changed:
+            src = os.path.join(SRC, path)
+            dst = os.path.join(root, path)
+            if os.path.exists(src):
+                shutil.copyfile(src, dst)
+
+
+REPORT = {} if os.environ.get("BR_PROBE_REPORT") else None
+PROBE_BASE_MS = 700  # interpreter + sqlglot + duckdb/pandas imports
+
+
+def pick_probe(cands, maps):
+    """Cheapest tests first, charging class setup and module import the first time each is used."""
+    pc = maps.probe_cost
+    tcost, ccost, mcost = pc["test"], pc["class"], pc["module"]
+    items = []
+    for t in cands:
+        tid = maps.id_of[t]
+        if tid not in tcost:
+            continue
+        cls = tid.rsplit("::", 1)[0]
+        items.append((tcost[tid] + ccost.get(cls, 0) + mcost.get(tid.split("::")[0], 0), tid, t))
+    items.sort()
+    used, seen_c, seen_m, out = 0, set(), set(), []
+    for _, tid, t in items:
+        cls, mod = tid.rsplit("::", 1)[0], tid.split("::")[0]
+        c = tcost[tid] + (0 if cls in seen_c else ccost.get(cls, 0)) + (0 if mod in seen_m else mcost.get(mod, 0))
+        if used + c > PROBE_BUDGET_MS:
+            continue
+        used += c
+        seen_c.add(cls)
+        seen_m.add(mod)
+        out.append(t)
+    return out
+
+
+def maybe_drop_heavy(sel, ms, an, maps, notes):
+    import time
+    heavy = {t for t in sel if ms[t] >= HEAVY_MS}
+    if not PROBE or not heavy or not an.changed_py or an.other_change:
+        return sel
+    if time.time() - _t0 > PROBE_WALL_BUDGET:
+        notes.append("probe-skipped-time")
+        return sel
+    rest = sel - heavy
+    saving = schedule(sel, ms)[1] - schedule(rest, ms)[1]
+    if saving < PROBE_MIN_SAVING_MS:
+        return sel
+    probe = pick_probe(rest, maps)
+    if len(probe) < PROBE_MIN_TESTS:
+        notes.append("probe-too-few")
+        return sel
+    if REPORT is not None:
+        REPORT[an.cid] = {"heavy": [maps.id_of[t] for t in heavy], "probe": [maps.id_of[t] for t in probe]}
+        return sel
+    ids = [maps.id_of[t] for t in probe]
+    if run_probe(an.changed_py, ids):
+        notes.append(f"probe-live:{len(probe)}")
+        return sel
+    notes.append(f"probe-pass:{len(probe)}:drop{len(heavy)}")
+    return rest
 
 
 # --------------------------------------------------------------------------- scheduling
@@ -766,6 +877,9 @@ def schedule(sel, ms):
 
 
 def main():
+    global _t0
+    import time
+    _t0 = time.time()
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     ms = {t["number"]: int(round(t["seconds"] * 1000)) for t in tests}
     maps = Maps(tests)
@@ -783,6 +897,9 @@ def main():
             files = parse_patch(text)
             sel = set()
             an.pending = {}
+            an.cid = cid
+            an.changed_py = {}
+            an.other_change = False
             for f in files:
                 sel |= an.analyze_file(f, notes)
             if an.pending:
@@ -798,11 +915,19 @@ def main():
             notes.append(f"error:{type(e).__name__}:{e}")
             sel = set(maps.everything)
         sel &= maps.everything
+        if not any(n.startswith("error") for n in notes):
+            try:
+                sel = maybe_drop_heavy(sel, ms, an, maps, notes)
+            except Exception as e:  # noqa
+                log("probe error", e)
         bins, cost = schedule(sel, ms)
         total += cost
         log(cid, len(sel), cost / 1000, notes[:6])
         print(json.dumps({"commit": cid, "workers": bins}, separators=(",", ":")))
     log("simulated selection cost", total / 1000)
+    if REPORT is not None:
+        with open(os.environ["BR_PROBE_REPORT"], "w") as fh:
+            json.dump(REPORT, fh)
 
 
 if __name__ == "__main__":

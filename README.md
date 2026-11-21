@@ -1,18 +1,20 @@
 # Blast Radius entry
 
 Picks, for each sqlglot patch, only the tests that can reach the changed code, then packs them onto
-workers to minimise `busiest worker + 2 s/worker`. Sample set: **165.6 s simulated, 0 misses**
-(starter: 1210.5 s on the same 30 commits; oracle: 94.4 s). Selector CPU ≈ 0.4 s for the batch.
+workers to minimise `busiest worker + 2 s/worker`. Sample set: **127.4 s simulated, 0 misses** (v1 without the probe: 165.6 s;
+starter: 1210.5 s; oracle: 94.4 s). CPU ≈ 8.5 s for the batch, almost all of it the probe.
 
 ## Layout
 
 | Path | What |
 | --- | --- |
-| `selector.py` | The program the image runs (stdlib only). |
+| `selector.py` | The program the image runs. |
+| `probe_runner.py`, `probe_runner_lib.py` | Runs a few sqlglot tests in-process against a patched copy. |
 | `maps/maps.json.gz` | Maps built from sqlglot's own tests at eb11aec: per-line coverage, class users, files each test reads, imports, attribute readers. |
-| `src/` | Pinned sqlglot `.py` sources (MIT, see `src/LICENSE-sqlglot`), so each patch's files can be rebuilt and AST-diffed. |
+| `src/` | Pinned sqlglot `.py` sources and test fixtures (MIT, see `src/LICENSE-sqlglot`), so each patch's files can be rebuilt and AST-diffed. |
 | `build/build_maps.sh` | Rebuilds `maps/` and `src/` from scratch (~6 min, 2 cores). Never run in the Docker build. |
 | `build/traceplug2.py` | pytest plugin used by the map build (inline process pools, file/class traces). |
+| `build/probe_costs.py` | Measures each test's inline CPU for the probe's budget. |
 | `build/mutants.py` | Offline harness: random single-line mutants, runs the selector and the tests, logs misses. Evaluation only. |
 | `Makefile`, `score.py`, `sample/` | The organisers' kit. |
 
@@ -43,4 +45,8 @@ BR_DATA=sample BR_SRC=src python3 selector.py > out.jsonl && python3 score.py sa
    files importing it.
 4. Any other file: tests that opened it during the traced run (setup-time reads widen to the class,
    collection-time reads to the file). pytest config edits select everything.
-5. Schedule: LPT for k = 1..8, keep the cheapest `max load + 2 s·k`.
+5. Heavy-test probe (tests ≥ 3 s, mainly test_execute_tpcds): when dropping them would save ≥ 6 s, run the
+   cheapest candidate tests (≈2 s of measured CPU) against the patched code in /tmp, stopping at the first
+   failure. Any failure, crash or timeout keeps the heavy tests; a clean pass drops them. Cheap tests are
+   always kept. On 37 offline mutants in code TPC-DS covers, every heavy failure (13) came with a probe failure.
+6. Schedule: LPT for k = 1..8, keep the cheapest `max load + 2 s·k`.

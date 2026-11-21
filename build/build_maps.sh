@@ -40,8 +40,10 @@ for f in sorted(glob.glob("tests/test_*.py") + glob.glob("tests/dialects/test_*.
     out[f] = r.stdout.split() if r.returncode == 0 else ["ERROR"]
 json.dump(out, open("$RAW/collect_imports.json", "w"))
 PY
-# 4. compact maps + vendored sources
-python "$HERE/make_maps.py" "$ENTRY/sample/tests.json" "$ENTRY/maps/maps.json.gz"
+# 4. vendored sources + fixtures, measured probe costs, compact maps
 rm -rf "$ENTRY/src"; mkdir -p "$ENTRY/src"
-git ls-files 'sqlglot/*.py' 'sqlglot/**/*.py' 'tests/*.py' 'tests/**/*.py' | sort -u | tar cf - -T - | tar xf - -C "$ENTRY/src"
+git ls-files 'sqlglot/*.py' 'sqlglot/**/*.py' 'tests/*.py' 'tests/**/*.py' 'tests/fixtures' | sort -u | tar cf - -T - | tar xf - -C "$ENTRY/src"
+cp LICENSE "$ENTRY/src/LICENSE-sqlglot"
+python "$HERE/probe_costs.py" "$ENTRY/src" "$RAW/probe_costs.json" "$ENTRY/sample/tests.json" 2>/dev/null
+python "$HERE/make_maps.py" "$ENTRY/sample/tests.json" "$ENTRY/maps/maps.json.gz"
 echo "maps and src rebuilt"
