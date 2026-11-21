@@ -45,5 +45,6 @@ rm -rf "$ENTRY/src"; mkdir -p "$ENTRY/src"
 git ls-files 'sqlglot/*.py' 'sqlglot/**/*.py' 'tests/*.py' 'tests/**/*.py' 'tests/fixtures' | sort -u | tar cf - -T - | tar xf - -C "$ENTRY/src"
 cp LICENSE "$ENTRY/src/LICENSE-sqlglot"
 python "$HERE/probe_costs.py" "$ENTRY/src" "$RAW/probe_costs.json" "$ENTRY/sample/tests.json" 2>/dev/null
+python "$HERE/import_consumers.py" "$SQLGLOT" "$RAW/import_consumers.json"
 python "$HERE/make_maps.py" "$ENTRY/sample/tests.json" "$ENTRY/maps/maps.json.gz"
 echo "maps and src rebuilt"

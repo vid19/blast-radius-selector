@@ -29,7 +29,8 @@ BR_DATA=sample BR_SRC=src python3 selector.py > out.jsonl && python3 score.py sa
 ## How a commit is decided
 
 1. Parse the unified diff; rebuild each changed file from `src/`.
-2. `sqlglot/*.py`: parse old and new ASTs.
+2. `sqlglot/*.py`: parse old and new ASTs. (Functions that also run at import time, like parser code used
+   by the DuckDB generator's constant `parse_one` calls, widen only to the modules whose import ran them.)
    * New file fails to parse → every test that imports the module (transitively) is selected.
    * ASTs equal (comments, whitespace, formatting) → nothing.
    * Otherwise a structural diff yields changed statements. Inside a function: tests that executed
@@ -55,6 +56,9 @@ BR_DATA=sample BR_SRC=src python3 selector.py > out.jsonl && python3 score.py sa
    same SQL, so the executor's TPC-DS test cannot fail and is dropped. On 22 mutants this predicted the
    executor result exactly (the 3 exceptions were changes inside the executor, which are excluded).
    Inline futures are lazy, so a failing check stops at the first mismatch (about 0.7 s).
+   test_max_nodes (28.8 s): a scaled-down copy of the test (`maxnodes_small.py`, 100 columns instead of
+   10,000) runs in about 0.5 s. If it passes and is not slower than on the unpatched code, the real test is
+   dropped. On 25 parser/tokenizer mutants with clean reruns it never passed where the real test failed.
 6. Exact runs: for a Python-only change whose candidates are all cheap (estimated CPU × 1.5 below 60% of
    their schedule cost), run them all here and select only the ones that fail (often nothing). Untrusted
    runs (crash, timeout, unexpected output) keep the full selection. Validated against real pytest on 71

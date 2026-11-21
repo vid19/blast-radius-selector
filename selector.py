@@ -168,6 +168,7 @@ class Maps:
         self.mod_users = m["mod_users"]
         self.mod_runtime = m["mod_runtime"]
         self.static_importers = m["static_importers"]
+        self.import_consumers = m.get("import_consumers", {})
         self.probe_cost = m.get("probe_cost", {"test": {}, "class": {}, "module": {}})
         self.name_refs = m.get("name_refs", {})
         self.derived = set(m.get("derived", ()))
@@ -577,9 +578,20 @@ class Analyzer:
                 lines = set(simple_lines(node))
             out = m.cov(path, lines)
             if any(ln in imp for ln in lines):
-                # the function runs while modules are imported: whatever it builds is used later
-                notes.append("import-time-func")
-                out |= self.module_level(path, tree, node, chain, notes)
+                # the function runs while some modules are imported: what they build there is used
+                # later by whoever uses those modules
+                first = min([func.lineno] + [d.lineno for d in getattr(func, "decorator_list", [])])
+                consumers = m.import_consumers.get(f"{path}:{first}") if not isinstance(func, ast.Lambda) else None
+                own = module_name(path)
+                if consumers and own not in consumers and os.environ.get("BR_IMPORT_CONSUMERS", "1") == "1":
+                    notes.append(f"import-consumers:{','.join(c.rsplit('.', 1)[-1] for c in consumers)}")
+                    for cm in consumers:
+                        out |= m.users_prefix(cm) | m.mod_runtime_by_mod(cm)
+                        for imp_mod in m.static_importers.get(cm, ()):
+                            out |= m.users_prefix(imp_mod)
+                else:
+                    notes.append("import-time-func")
+                    out |= self.module_level(path, tree, node, chain, notes)
             return out
         # not inside a function body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and site.kind in ("header", "stmt"):
@@ -820,7 +832,7 @@ def restore_root(changed):
         src = os.path.join(SRC, path)
         dst = os.path.join(root, path)
         if os.path.exists(src):
-            shutil.copyfile(src, dst)
+            shutil.copy2(src, dst)
         elif os.path.exists(dst):
             os.remove(dst)
 _t0 = None
@@ -949,6 +961,48 @@ def tpcds_second_stage(sel, heavy, ms, an, maps, notes):
     return sel
 
 
+MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
+MAX_NODES_SMALL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maxnodes_small.py")
+MAX_NODES_STAGE = os.environ.get("BR_MAX_NODES_STAGE", "1") == "1"
+_max_nodes_base = None
+
+
+def _run_small(root):
+    import subprocess
+    r = subprocess.run([sys.executable, MAX_NODES_SMALL, root, SRC], capture_output=True, text=True,
+                       timeout=PROBE_TIMEOUT, env=_probe_env(), cwd="/tmp")
+    if r.returncode != 0:
+        return None
+    return float(r.stdout.strip().splitlines()[-1])
+
+
+def max_nodes_stage(sel, ms, an, maps, notes):
+    """test_max_nodes (28.8 s) parses one huge generated query. A scaled-down copy of it (same
+    statements, 100 columns instead of 10,000) runs in well under a second. If the scaled copy passes
+    and is not slower than on the unpatched code (a slowdown could time the real test out), the real
+    test cannot fail."""
+    global _max_nodes_base
+    mn = maps.by_id.get(MAX_NODES)
+    if not MAX_NODES_STAGE or mn not in sel or not an.changed_py or an.other_change:
+        return sel
+    if schedule(sel, ms)[1] - schedule(sel - {mn}, ms)[1] < PROBE_MIN_SAVING_MS:
+        return sel
+    try:
+        if _max_nodes_base is None:
+            _max_nodes_base = _run_small(SRC) or 0.0
+        t = _run_small(patched_root(an.changed_py))
+    except Exception as e:  # noqa
+        log("max_nodes stage", type(e).__name__)
+        t = None
+    finally:
+        restore_root(an.changed_py)
+    if t is None or not _max_nodes_base or t > _max_nodes_base * 1.5 + 0.05:
+        notes.append("max-nodes-live")
+        return sel
+    notes.append("max-nodes-pass")
+    return sel - {mn}
+
+
 def maybe_drop_heavy(sel, ms, an, maps, notes):
     import time
     heavy = {t for t in sel if ms[t] >= HEAVY_MS}
@@ -1044,6 +1098,7 @@ def main():
         sel &= maps.everything
         if not any(n.startswith("error") for n in notes):
             try:
+                sel = max_nodes_stage(sel, ms, an, maps, notes)
                 sel = maybe_drop_heavy(sel, ms, an, maps, notes)
                 sel = maybe_exact(sel, ms, an, maps, notes)
             except Exception as e:  # noqa

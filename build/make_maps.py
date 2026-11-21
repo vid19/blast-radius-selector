@@ -193,3 +193,11 @@ if os.path.exists(pc_path):
     raw = json.dumps(out, separators=(",", ":")).encode()
     gzip.open(sys.argv[2], "wb", 9).write(raw)
     print("with probe costs", len(raw) / 1e6)
+
+# ---- which modules' import-time code reaches each function (build/import_consumers.py)
+ic_path = RAW + "import_consumers.json"
+if os.path.exists(ic_path):
+    out["import_consumers"] = json.load(open(ic_path))
+    raw = json.dumps(out, separators=(",", ":")).encode()
+    gzip.open(sys.argv[2], "wb", 9).write(raw)
+    print("with import consumers", len(raw) / 1e6)
