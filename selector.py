@@ -1136,6 +1136,8 @@ def main():
                 sel = maybe_exact(sel, ms, an, maps, notes)
             except Exception as e:  # noqa
                 log("probe error", e)
+        if os.environ.get("BR_DIAG_DROP_HEAVY") == "1":  # diagnostic only: never select slow tests
+            sel = {t for t in sel if ms[t] < HEAVY_MS}
         bins, cost = schedule(sel, ms)
         total += cost
         log(cid, len(sel), cost / 1000, notes[:6])
