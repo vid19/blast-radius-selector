@@ -708,6 +708,59 @@ class Analyzer:
             out |= in_file | dependents
         return out
 
+    # TestExecutor.setUpClass loads both TPC fixtures as (meta, sql, expected) pairs, so every executor
+    # test "reads" them; only these tests use them, and only these parts.
+    TPC_USERS = {
+        "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": {"tests/test_executor.py::TestExecutor::test_execute_tpcds": ("meta", "sql")},
+        "tests/fixtures/optimizer/tpc-h/tpc-h.sql": {
+            "tests/test_executor.py::TestExecutor::test_execute_tpch": ("meta", "sql"),
+            "tests/test_executor.py::TestExecutor::test_optimized_tpch": ("sql", "expected"),
+        },
+    }
+
+    @staticmethod
+    def _fixture_pairs(text):
+        """tests/helpers.py load_sql_fixture_pairs, with _filter_comments and _extract_meta, verbatim."""
+        text = "\n".join([line for line in text.splitlines() if line and not line.startswith("--")])
+        statements = text.split(";")
+        out = []
+        for i in range(0, len(statements), 2):
+            if i + 1 < len(statements):
+                sql = statements[i].strip()
+                meta = {}
+                lines = sql.split("\n")
+                j = 0
+                while lines[j].startswith("#"):
+                    key, val = lines[j].split(":", maxsplit=1)
+                    meta[key.lstrip("#").strip()] = val.strip()
+                    j += 1
+                sql = "\n".join(lines[j:])
+                out.append({"meta": meta, "sql": sql, "expected": statements[i + 1].strip()})
+        return out
+
+    def tpc_fixture(self, path, old_path, new_path, old_text, new_text, notes):
+        m = self.m
+        users = self.TPC_USERS.get(path)
+        if users is None or old_path != new_path or old_text is None or new_text is None:
+            return None
+        try:
+            old_pairs, new_pairs = self._fixture_pairs(old_text), self._fixture_pairs(new_text)
+        except Exception:  # the executor's setUpClass would fail too: every reader is affected
+            notes.append("tpc-fixture-broken")
+            return None
+        executor = m.by_class.get("tests/test_executor.py::TestExecutor", set())
+        out = m.opened(path) - executor
+        for tid, fields in users.items():
+            t = m.by_id.get(tid)
+            if t is None:
+                continue
+            if len(old_pairs) != len(new_pairs) or any(
+                o[f] != n[f] for o, n in zip(old_pairs, new_pairs) for f in fields
+            ):
+                out.add(t)
+        notes.append(f"tpc-fixture:{len(out)}")
+        return out
+
     def analyze_file(self, f, notes):
         m = self.m
         old_path, new_path = f["old"], f["new"]
@@ -750,6 +803,9 @@ class Analyzer:
             if re.search(r"pytest|addopts|filterwarnings|timeout|testpaths|python_files", changed):
                 notes.append("pytest-config")
                 return set(m.everything)
+        tpc = self.tpc_fixture(path, old_path, new_path, old_text, new_text, notes)
+        if tpc is not None:
+            return out | tpc
         out |= m.opened(path)
         if old_path:
             out |= m.opened(old_path)
@@ -1136,6 +1192,8 @@ def main():
                 sel = maybe_exact(sel, ms, an, maps, notes)
             except Exception as e:  # noqa
                 log("probe error", e)
+        if os.environ.get("BR_DIAG_DROP_HEAVY") == "1":  # diagnostic only: never select slow tests
+            sel = {t for t in sel if ms[t] < HEAVY_MS}
         bins, cost = schedule(sel, ms)
         total += cost
         log(cid, len(sel), cost / 1000, notes[:6])
