@@ -50,6 +50,11 @@ BR_DATA=sample BR_SRC=src python3 selector.py > out.jsonl && python3 score.py sa
    cheapest candidate tests (≈2 s of measured CPU) against the patched code in /tmp, stopping at the first
    failure. Any failure, crash or timeout keeps the heavy tests; a clean pass drops them. Cheap tests are
    always kept. On 37 offline mutants in code TPC-DS covers, every heavy failure (13) came with a probe failure.
+   Second stage: when the probe says live, the change is outside execution code, and the optimizer's
+   own TPC-DS test is a candidate, run that test here. If it passes, every TPC-DS query optimizes to the
+   same SQL, so the executor's TPC-DS test cannot fail and is dropped. On 22 mutants this predicted the
+   executor result exactly (the 3 exceptions were changes inside the executor, which are excluded).
+   Inline futures are lazy, so a failing check stops at the first mismatch (about 0.7 s).
 6. Exact runs: for a Python-only change whose candidates are all cheap (estimated CPU × 1.5 below 60% of
    their schedule cost), run them all here and select only the ones that fail (often nothing). Untrusted
    runs (crash, timeout, unexpected output) keep the full selection. Validated against real pytest on 71

@@ -921,6 +921,34 @@ def pick_probe(cands, maps):
     return out
 
 
+EX_TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+OPT_TPCDS = "tests/test_optimizer.py::TestOptimizer::test_tpcds"
+EXECUTION_CODE = ("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/generators/python.py")
+TPCDS_STAGE2 = os.environ.get("BR_TPCDS_STAGE2", "1") == "1"
+
+
+def tpcds_second_stage(sel, heavy, ms, an, maps, notes):
+    """The executor's TPC-DS test optimizes then executes the TPC-DS queries. If the optimizer's
+    own TPC-DS test (same queries, optimized SQL compared to the expected text) still passes and
+    the change is not in execution code, the executor sees the same plans, so it cannot fail."""
+    ex, opt = maps.by_id.get(EX_TPCDS), maps.by_id.get(OPT_TPCDS)
+    if not TPCDS_STAGE2 or ex not in heavy or opt not in sel:
+        return sel
+    if any(p.startswith(EXECUTION_CODE) for p in an.changed_py):
+        return sel
+    if schedule(sel, ms)[1] - schedule(sel - {ex}, ms)[1] < PROBE_MIN_SAVING_MS:
+        return sel
+    try:
+        failed = probe_request(patched_root(an.changed_py), [OPT_TPCDS], False)
+    finally:
+        restore_root(an.changed_py)
+    if failed == []:
+        notes.append("tpcds-stage2-pass")
+        return sel - {ex}
+    notes.append("tpcds-stage2-live")
+    return sel
+
+
 def maybe_drop_heavy(sel, ms, an, maps, notes):
     import time
     heavy = {t for t in sel if ms[t] >= HEAVY_MS}
@@ -943,7 +971,7 @@ def maybe_drop_heavy(sel, ms, an, maps, notes):
     ids = [maps.id_of[t] for t in probe]
     if run_probe(an.changed_py, ids):
         notes.append(f"probe-live:{len(probe)}")
-        return sel
+        return tpcds_second_stage(sel, heavy, ms, an, maps, notes)
     notes.append(f"probe-pass:{len(probe)}:drop{len(heavy)}")
     return rest
 

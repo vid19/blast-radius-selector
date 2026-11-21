@@ -3,22 +3,44 @@ import pickle
 
 
 class _Future:
-    def __init__(self):
+    """Computed on first use, so tests that submit everything and then compare one by one stop
+    doing work as soon as a comparison fails."""
+
+    def __init__(self, fn, args, kwargs):
+        self._call = (fn, args, kwargs)
         self._r = self._e = None
 
+    def _run(self):
+        if self._call is not None:
+            fn, args, kwargs = self._call
+            self._call = None
+            try:
+                a, k = pickle.loads(pickle.dumps((args, kwargs)))
+                self._r = pickle.loads(pickle.dumps(fn(*a, **k)))
+            except BaseException as e:  # noqa
+                self._e = e
+
     def result(self, timeout=None):
+        self._run()
         if self._e is not None:
             raise self._e
         return self._r
 
     def exception(self, timeout=None):
+        self._run()
         return self._e
 
     def done(self):
         return True
 
+    def cancelled(self):
+        return False
+
     def add_done_callback(self, fn):
         fn(self)
+
+    def __hash__(self):
+        return id(self)
 
 
 class InlineExecutor:
@@ -27,13 +49,7 @@ class InlineExecutor:
             initializer(*pickle.loads(pickle.dumps(initargs)))
 
     def submit(self, fn, *args, **kwargs):
-        f = _Future()
-        try:
-            a, k = pickle.loads(pickle.dumps((args, kwargs)))
-            f._r = pickle.loads(pickle.dumps(fn(*a, **k)))
-        except BaseException as e:  # noqa
-            f._e = e
-        return f
+        return _Future(fn, args, kwargs)
 
     def map(self, fn, *its, **kw):
         return [self.submit(fn, *a).result() for a in zip(*its)]
@@ -46,7 +62,6 @@ class InlineExecutor:
 
     def __exit__(self, *a):
         pass
-
 
 
 def patch_module(mod):
@@ -86,7 +101,16 @@ def run_tests(patched, src, ids, run_all):
             continue
         id_of[case.id()] = tid
         suite.addTest(case)
-    result = unittest.TestResult()
+    class _Stop(Exception):
+        pass
+
+    class Result(unittest.TestResult):
+        def addSubTest(self, test, subtest, err):
+            super().addSubTest(test, subtest, err)
+            if err is not None and not run_all:
+                raise _Stop()  # one failing subtest already fails the test
+
+    result = Result()
     result.failfast = not run_all
     devnull = open(os.devnull, "w")
     out, err = sys.stdout, sys.stderr
