@@ -1003,6 +1003,38 @@ def max_nodes_stage(sel, ms, an, maps, notes):
     return sel - {mn}
 
 
+GENMEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
+GENMEM_CHECK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "genmem_check.py")
+GENMEM_STAGE = os.environ.get("BR_GENMEM_STAGE", "1") == "1"
+
+
+def genmem_stage(sel, ms, an, maps, notes):
+    """test_generator_memory runs the same leak check once per dialect. Run that exact check here,
+    only for the dialects built from (or importing) the changed modules."""
+    import subprocess
+    gm = maps.by_id.get(GENMEM)
+    if not GENMEM_STAGE or gm not in sel or not an.changed_py or an.other_change:
+        return sel
+    if schedule(sel, ms)[1] - schedule(sel - {gm}, ms)[1] < 2000:
+        return sel
+    mods = [module_name(p) for p in an.changed_py]
+    try:
+        root = patched_root(an.changed_py)
+        r = subprocess.run([sys.executable, GENMEM_CHECK, root, SRC] + mods, capture_output=True, text=True,
+                           timeout=PROBE_TIMEOUT, env=_probe_env(), cwd="/tmp")
+        code = r.returncode
+    except Exception as e:  # noqa
+        log("genmem stage", type(e).__name__)
+        code = 1
+    finally:
+        restore_root(an.changed_py)
+    if code == 0:
+        notes.append(f"genmem-pass:{len(r.stdout.split())}")
+        return sel - {gm}
+    notes.append("genmem-keep" if code == 2 else "genmem-live")
+    return sel
+
+
 def maybe_drop_heavy(sel, ms, an, maps, notes):
     import time
     heavy = {t for t in sel if ms[t] >= HEAVY_MS}
@@ -1099,6 +1131,7 @@ def main():
         if not any(n.startswith("error") for n in notes):
             try:
                 sel = max_nodes_stage(sel, ms, an, maps, notes)
+                sel = genmem_stage(sel, ms, an, maps, notes)
                 sel = maybe_drop_heavy(sel, ms, an, maps, notes)
                 sel = maybe_exact(sel, ms, an, maps, notes)
             except Exception as e:  # noqa
