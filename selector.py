@@ -441,6 +441,7 @@ class Analyzer:
         self.pending = {}
         self.changed_py = {}
         self.other_change = False
+        self.other_paths = set()
         self.ref_index = None
 
     def old_tree(self, path):
@@ -783,6 +784,7 @@ class Analyzer:
         path = old_path or new_path
         if not (path.endswith(".py") and path.startswith("sqlglot/")) or old_path is None or new_path is None or old_path != new_path:
             self.other_change = True
+            self.other_paths.update(p for p in (old_path, new_path) if p)
         elif new_text is not None:
             self.changed_py[path] = new_text
         if path.endswith(".py") and path.startswith("sqlglot/"):
@@ -894,6 +896,22 @@ def restore_root(changed):
 _t0 = None
 
 
+CONFIG_FILES = ("pyproject.toml", "setup.cfg", "setup.py", "pytest.ini", "tox.ini", "conftest.py")
+
+
+def independent(an, maps, tests):
+    """True if the commit's non-code changes cannot affect `tests`: none of them is Python or config, and
+    none of `tests` read any of them. Then a check run on the code change alone decides those tests."""
+    if not an.other_change:
+        return True
+    for p in an.other_paths:
+        if p.endswith(".py") or os.path.basename(p) in CONFIG_FILES or p.startswith("sqlglot/"):
+            return False
+        if maps.opened(p) & set(tests):
+            return False
+    return True
+
+
 def run_probe(changed, test_ids):
     """True if any test fails (or the run misbehaves): the change is live."""
     try:
@@ -945,7 +963,7 @@ def run_probe_all(changed, test_ids):
 def maybe_exact(sel, ms, an, maps, notes):
     """Small candidate sets on Python-only changes: run them all here and keep only the failures."""
     import time
-    if not EXACT or not sel or not an.changed_py or an.other_change:
+    if not EXACT or not sel or not an.changed_py or not independent(an, maps, sel):
         return sel
     if any(ms[t] >= HEAVY_MS for t in sel):
         return sel
@@ -1004,6 +1022,8 @@ def tpcds_second_stage(sel, heavy, ms, an, maps, notes):
         return sel
     if any(p.startswith(EXECUTION_CODE) for p in an.changed_py):
         return sel
+    if not independent(an, maps, {ex, opt}):
+        return sel
     if schedule(sel, ms)[1] - schedule(sel - {ex}, ms)[1] < PROBE_MIN_SAVING_MS:
         return sel
     try:
@@ -1039,7 +1059,7 @@ def max_nodes_stage(sel, ms, an, maps, notes):
     test cannot fail."""
     global _max_nodes_base
     mn = maps.by_id.get(MAX_NODES)
-    if not MAX_NODES_STAGE or mn not in sel or not an.changed_py or an.other_change:
+    if not MAX_NODES_STAGE or mn not in sel or not an.changed_py or not independent(an, maps, {mn}):
         return sel
     if schedule(sel, ms)[1] - schedule(sel - {mn}, ms)[1] < PROBE_MIN_SAVING_MS:
         return sel
@@ -1069,7 +1089,7 @@ def genmem_stage(sel, ms, an, maps, notes):
     only for the dialects built from (or importing) the changed modules."""
     import subprocess
     gm = maps.by_id.get(GENMEM)
-    if not GENMEM_STAGE or gm not in sel or not an.changed_py or an.other_change:
+    if not GENMEM_STAGE or gm not in sel or not an.changed_py or not independent(an, maps, {gm}):
         return sel
     if schedule(sel, ms)[1] - schedule(sel - {gm}, ms)[1] < 2000:
         return sel
@@ -1112,7 +1132,7 @@ def tpcds_fingerprint_stage(sel, ms, an, maps, notes):
     only influence on that test is through those outputs."""
     import subprocess
     ex = maps.by_id.get(EX_TPCDS)
-    if not FP_STAGE or ex not in sel or not an.changed_py or an.other_change:
+    if not FP_STAGE or ex not in sel or not an.changed_py or not independent(an, maps, {ex}):
         return sel
     if not all(_fp_file_ok(p) for p in an.changed_py) or not os.path.exists(FP_BASELINE):
         return sel
@@ -1138,7 +1158,7 @@ def tpcds_fingerprint_stage(sel, ms, an, maps, notes):
 def maybe_drop_heavy(sel, ms, an, maps, notes):
     import time
     heavy = {t for t in sel if ms[t] >= HEAVY_MS}
-    if not PROBE or not heavy or not an.changed_py or an.other_change:
+    if not PROBE or not heavy or not an.changed_py or not independent(an, maps, heavy):
         return sel
     if time.time() - _t0 > PROBE_WALL_BUDGET:
         notes.append("probe-skipped-time")
@@ -1213,6 +1233,7 @@ def main():
             an.cid = cid
             an.changed_py = {}
             an.other_change = False
+            an.other_paths = set()
             for f in files:
                 sel |= an.analyze_file(f, notes)
             if an.pending:
@@ -1242,6 +1263,25 @@ def main():
         for tid in filter(None, os.environ.get("BR_DIAG_DROP", "").split(",")):  # diagnostic only
             sel.discard(maps.by_id.get(tid))
         bins, cost = schedule(sel, ms)
+        if os.environ.get("BR_DIAG_ENCODE") == "1" and maps.by_id.get(EX_TPCDS) in sel:
+            # diagnostic only: add one marker test to the busiest worker; its duration encodes why the
+            # TPC-DS executor test is still selected (1 ms runtime code, 4 ms non-code change in the
+            # commit, 16 ms fingerprint saw a change, 67 ms anything else)
+            paths = list(an.changed_py)
+            if an.other_change or not paths:
+                want = 4
+            elif any(p.startswith("sqlglot/executor/") or p == "sqlglot/generators/python.py" for p in paths):
+                want = 1
+            elif "tpcds-fp-changed" in notes:
+                want = 16
+            else:
+                want = 67
+            marker = next((t for t in sorted(ms) if ms[t] == want and t not in sel), None)
+            if marker is not None and bins:
+                loads = [sum(ms[t] for t in b) for b in bins]
+                bins[loads.index(max(loads))].append(marker)
+                cost += want
+            log("diag-encode", want, paths[:3])
         total += cost
         log(cid, len(sel), cost / 1000, notes[:6])
         print(json.dumps({"commit": cid, "workers": bins}, separators=(",", ":")))
