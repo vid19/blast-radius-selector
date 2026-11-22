@@ -1242,6 +1242,25 @@ def main():
         for tid in filter(None, os.environ.get("BR_DIAG_DROP", "").split(",")):  # diagnostic only
             sel.discard(maps.by_id.get(tid))
         bins, cost = schedule(sel, ms)
+        if os.environ.get("BR_DIAG_ENCODE") == "1" and maps.by_id.get(EX_TPCDS) in sel:
+            # diagnostic only: add one marker test to the busiest worker; its duration encodes why the
+            # TPC-DS executor test is still selected (1 ms runtime code, 4 ms non-code change in the
+            # commit, 16 ms fingerprint saw a change, 67 ms anything else)
+            paths = list(an.changed_py)
+            if an.other_change or not paths:
+                want = 4
+            elif any(p.startswith("sqlglot/executor/") or p == "sqlglot/generators/python.py" for p in paths):
+                want = 1
+            elif "tpcds-fp-changed" in notes:
+                want = 16
+            else:
+                want = 67
+            marker = next((t for t in sorted(ms) if ms[t] == want and t not in sel), None)
+            if marker is not None and bins:
+                loads = [sum(ms[t] for t in b) for b in bins]
+                bins[loads.index(max(loads))].append(marker)
+                cost += want
+            log("diag-encode", want, paths[:3])
         total += cost
         log(cid, len(sel), cost / 1000, notes[:6])
         print(json.dumps({"commit": cid, "workers": bins}, separators=(",", ":")))

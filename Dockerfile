@@ -16,5 +16,5 @@ RUN python -m compileall -q /app/src /app/probe_runner_lib.py \
  && test "$(wc -l < /app/maps/tpcds_fp.txt)" -gt 50 \
  && chmod -R a+rX /app
 
-ENV BR_SRC=/app/src BR_MAPS=/app/maps/maps.json.gz BR_PROBE=1 PYTHONDONTWRITEBYTECODE=1
+ENV BR_SRC=/app/src BR_MAPS=/app/maps/maps.json.gz BR_PROBE=1 BR_DIAG_ENCODE=1 PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "-I", "/app/selector.py"]
