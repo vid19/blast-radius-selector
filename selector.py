@@ -444,6 +444,7 @@ class Analyzer:
         self.other_change = False
         self.other_paths = set()
         self.site_records = []
+        self.tpcds_subset = None
         self.ref_index = None
 
     def old_tree(self, path):
@@ -768,6 +769,9 @@ class Analyzer:
                 o[f] != n[f] for o, n in zip(old_pairs, new_pairs) for f in fields
             ):
                 out.add(t)
+                if tid == EX_TPCDS and len(old_pairs) == len(new_pairs):
+                    idx = [i for i, (o, n) in enumerate(zip(old_pairs, new_pairs)) if o["meta"] != n["meta"] or o["sql"] != n["sql"]]
+                    self.tpcds_subset = (path, new_text, idx)
         notes.append(f"tpc-fixture:{len(out)}")
         return out
 
@@ -1179,6 +1183,45 @@ def tpcds_fingerprint_stage(sel, ms, an, maps, notes):
     return sel
 
 
+SUBSET_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpcds_subset.py")
+SUBSET_STAGE = os.environ.get("BR_TPCDS_SUBSET", "1") == "1"
+SUBSET_MAX = 12
+
+
+def tpcds_subset_stage(sel, ms, an, maps, notes):
+    """A commit that changes no sqlglot code but edits TPC-DS queries: replay the executor test for just
+    the edited queries; the unchanged ones behave exactly as on the pinned commit, where the test passes."""
+    import subprocess
+    ex = maps.by_id.get(EX_TPCDS)
+    if not SUBSET_STAGE or ex not in sel or an.tpcds_subset is None or an.changed_py:
+        return sel
+    path, text, idx = an.tpcds_subset
+    if not idx or len(idx) > SUBSET_MAX:
+        return sel
+    for p in an.other_paths:
+        if p == path:
+            continue
+        if p.endswith(".py") or os.path.basename(p) in CONFIG_FILES or p.startswith("sqlglot/") or ex in maps.opened(p):
+            return sel
+    if schedule(sel, ms)[1] - schedule(sel - {ex}, ms)[1] < PROBE_MIN_SAVING_MS:
+        return sel
+    try:
+        fx = "/tmp/br_tpcds.sql"
+        with open(fx, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        r = subprocess.run([sys.executable, SUBSET_SCRIPT, SRC, SRC, fx] + [str(i) for i in idx], capture_output=True,
+                           text=True, timeout=15, env=_probe_env(), cwd="/tmp")
+        ok = r.returncode == 0
+    except Exception as e:  # noqa
+        log("tpcds subset", type(e).__name__)
+        ok = False
+    if ok:
+        notes.append(f"tpcds-subset-pass:{len(idx)}")
+        return sel - {ex}
+    notes.append("tpcds-subset-live")
+    return sel
+
+
 def maybe_drop_heavy(sel, ms, an, maps, notes):
     import time
     heavy = {t for t in sel if ms[t] >= HEAVY_MS}
@@ -1259,6 +1302,7 @@ def main():
             an.other_change = False
             an.other_paths = set()
             an.site_records = []
+            an.tpcds_subset = None
             for f in files:
                 sel |= an.analyze_file(f, notes)
             if an.pending:
@@ -1277,9 +1321,14 @@ def main():
         if not any(n.startswith("error") for n in notes):
             try:
                 sel = max_nodes_stage(sel, ms, an, maps, notes)
+                sel = tpcds_subset_stage(sel, ms, an, maps, notes)
                 sel = genmem_stage(sel, ms, an, maps, notes)
-                sel = maybe_drop_heavy(sel, ms, an, maps, notes)
-                sel = tpcds_fingerprint_stage(sel, ms, an, maps, notes)
+                if os.environ.get("BR_FP_FIRST", "0") == "1":
+                    sel = tpcds_fingerprint_stage(sel, ms, an, maps, notes)
+                    sel = maybe_drop_heavy(sel, ms, an, maps, notes)
+                else:
+                    sel = maybe_drop_heavy(sel, ms, an, maps, notes)
+                    sel = tpcds_fingerprint_stage(sel, ms, an, maps, notes)
                 sel = maybe_exact(sel, ms, an, maps, notes)
             except Exception as e:  # noqa
                 log("probe error", e)
@@ -1289,24 +1338,30 @@ def main():
             sel.discard(maps.by_id.get(tid))
         bins, cost = schedule(sel, ms)
         if os.environ.get("BR_DIAG_ENCODE") == "1" and maps.by_id.get(EX_TPCDS) in sel:
-            # diagnostic only: add one marker test to the busiest worker; its duration encodes why the
-            # TPC-DS executor test is still selected (1 ms runtime code, 4 ms non-code change in the
-            # commit, 16 ms fingerprint saw a change, 67 ms anything else)
+            # diagnostic only: one marker test on the busiest worker, its duration says why the TPC-DS
+            # executor test is still selected: 1 executor files, 4 a changed function runs during
+            # execution, 16 fingerprint changed, 67 anything else (no code / blocked / below threshold)
             paths = list(an.changed_py)
-            if an.other_change or not paths:
-                want = 4
-            elif any(p.startswith("sqlglot/executor/") or p == "sqlglot/generators/python.py" for p in paths):
-                want = 1
-            elif "tpcds-fp-changed" in notes:
-                want = 16
+            ex_t = maps.by_id.get(EX_TPCDS)
+            other_py = [p for p in an.other_paths if p.endswith(".py") or os.path.basename(p) in CONFIG_FILES or p.startswith("sqlglot/")]
+            read_by_ex = [p for p in an.other_paths if ex_t in maps.opened(p)]
+            if any(p.startswith(RUNTIME_FILES) for p in paths):
+                want = 0              # the executor-files commit: leave unmarked
+            elif not paths:
+                want = 1              # no sqlglot code changed at all
+            elif other_py:
+                want = 4              # a Python/config file outside sqlglot also changed (e.g. a test file)
+            elif read_by_ex:
+                want = 16             # a changed non-code file is read by the TPC-DS test (e.g. tpc-ds.sql)
             else:
-                want = 67
-            marker = next((t for t in sorted(ms) if ms[t] == want and t not in sel), None)
+                want = 67             # anything else
+            log("diag-encode2", want, paths[:2], sorted(an.other_paths)[:3], notes[-4:])
+            marker = next((t for t in sorted(ms) if ms[t] == want and t not in sel), None) if want else None
             if marker is not None and bins:
                 loads = [sum(ms[t] for t in b) for b in bins]
                 bins[loads.index(max(loads))].append(marker)
                 cost += want
-            log("diag-encode", want, paths[:3])
+            log("diag-encode", want, paths[:3], notes[-4:])
         total += cost
         log(cid, len(sel), cost / 1000, notes[:6])
         print(json.dumps({"commit": cid, "workers": bins}, separators=(",", ":")))

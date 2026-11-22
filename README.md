@@ -48,6 +48,9 @@ BR_DATA=sample BR_SRC=src python3 selector.py > out.jsonl && python3 score.py sa
 4. TPC fixtures (`tpc-ds.sql`, `tpc-h.sql`): the executor class reads them in setUpClass, but only three tests use
    them, and only some fields. The file is parsed exactly as `load_sql_fixture_pairs` does; executor tests are
    kept only if the fields they use changed (or the file no longer parses). Expected-output edits cost 4 s, not 25 s.
+   Query edits to `tpc-ds.sql` in a commit with no sqlglot code change: replay the executor test for just the
+   edited queries (`tpcds_subset.py`, using the test's own setUpClass/mp_execute/cached_execute and pickle
+   round trips). Unchanged queries behave as on the pinned commit. 17 edits: replay and real test agreed.
 5. Any other file: tests that opened it during the traced run (setup-time reads widen to the class,
    collection-time reads to the file). pytest config edits select everything.
 5. Heavy-test probe (tests ≥ 3 s, mainly test_execute_tpcds): when dropping them would save ≥ 6 s, run the
