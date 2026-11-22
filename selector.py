@@ -1278,8 +1278,12 @@ def main():
             try:
                 sel = max_nodes_stage(sel, ms, an, maps, notes)
                 sel = genmem_stage(sel, ms, an, maps, notes)
-                sel = maybe_drop_heavy(sel, ms, an, maps, notes)
-                sel = tpcds_fingerprint_stage(sel, ms, an, maps, notes)
+                if os.environ.get("BR_FP_FIRST", "0") == "1":
+                    sel = tpcds_fingerprint_stage(sel, ms, an, maps, notes)
+                    sel = maybe_drop_heavy(sel, ms, an, maps, notes)
+                else:
+                    sel = maybe_drop_heavy(sel, ms, an, maps, notes)
+                    sel = tpcds_fingerprint_stage(sel, ms, an, maps, notes)
                 sel = maybe_exact(sel, ms, an, maps, notes)
             except Exception as e:  # noqa
                 log("probe error", e)
@@ -1289,24 +1293,30 @@ def main():
             sel.discard(maps.by_id.get(tid))
         bins, cost = schedule(sel, ms)
         if os.environ.get("BR_DIAG_ENCODE") == "1" and maps.by_id.get(EX_TPCDS) in sel:
-            # diagnostic only: add one marker test to the busiest worker; its duration encodes why the
-            # TPC-DS executor test is still selected (1 ms runtime code, 4 ms non-code change in the
-            # commit, 16 ms fingerprint saw a change, 67 ms anything else)
+            # diagnostic only: one marker test on the busiest worker, its duration says why the TPC-DS
+            # executor test is still selected: 1 executor files, 4 a changed function runs during
+            # execution, 16 fingerprint changed, 67 anything else (no code / blocked / below threshold)
             paths = list(an.changed_py)
-            if an.other_change or not paths:
-                want = 4
-            elif any(p.startswith("sqlglot/executor/") or p == "sqlglot/generators/python.py" for p in paths):
-                want = 1
-            elif "tpcds-fp-changed" in notes:
-                want = 16
+            ex_t = maps.by_id.get(EX_TPCDS)
+            other_py = [p for p in an.other_paths if p.endswith(".py") or os.path.basename(p) in CONFIG_FILES or p.startswith("sqlglot/")]
+            read_by_ex = [p for p in an.other_paths if ex_t in maps.opened(p)]
+            if any(p.startswith(RUNTIME_FILES) for p in paths):
+                want = 0              # the executor-files commit: leave unmarked
+            elif not paths:
+                want = 1              # no sqlglot code changed at all
+            elif other_py:
+                want = 4              # a Python/config file outside sqlglot also changed (e.g. a test file)
+            elif read_by_ex:
+                want = 16             # a changed non-code file is read by the TPC-DS test (e.g. tpc-ds.sql)
             else:
-                want = 67
-            marker = next((t for t in sorted(ms) if ms[t] == want and t not in sel), None)
+                want = 67             # anything else
+            log("diag-encode2", want, paths[:2], sorted(an.other_paths)[:3], notes[-4:])
+            marker = next((t for t in sorted(ms) if ms[t] == want and t not in sel), None) if want else None
             if marker is not None and bins:
                 loads = [sum(ms[t] for t in b) for b in bins]
                 bins[loads.index(max(loads))].append(marker)
                 cost += want
-            log("diag-encode", want, paths[:3])
+            log("diag-encode", want, paths[:3], notes[-4:])
         total += cost
         log(cid, len(sel), cost / 1000, notes[:6])
         print(json.dumps({"commit": cid, "workers": bins}, separators=(",", ":")))
