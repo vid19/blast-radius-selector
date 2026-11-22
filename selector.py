@@ -170,6 +170,7 @@ class Maps:
         self.static_importers = m["static_importers"]
         self.import_consumers = m.get("import_consumers", {})
         self.probe_cost = m.get("probe_cost", {"test": {}, "class": {}, "module": {}})
+        self.ex_runtime = {k: set(v) for k, v in m.get("ex_runtime_lines", {}).items()}
         self.name_refs = m.get("name_refs", {})
         self.derived = set(m.get("derived", ()))
         self.mapped = set(x for x in remap if x is not None)
@@ -442,6 +443,7 @@ class Analyzer:
         self.changed_py = {}
         self.other_change = False
         self.other_paths = set()
+        self.site_records = []
         self.ref_index = None
 
     def old_tree(self, path):
@@ -544,6 +546,13 @@ class Analyzer:
         for s in sites:
             cands |= self.site_candidates(path, old, s, notes)
             in_func = any(isinstance(c, FUNC) for c in s.chain)
+            fn = next((c for c in reversed(s.chain) if isinstance(c, FUNC)), None)
+            if fn is not None and not isinstance(fn, ast.Lambda):
+                self.site_records.append((path, frozenset(range(fn.body[0].lineno, (fn.end_lineno or fn.lineno) + 1))))
+            elif fn is not None:
+                self.site_records.append((path, frozenset(span(fn))))
+            else:
+                self.site_records.append((path, None))
             if not in_func and not (s.kind in ("stmt", "header") and literal_only_change(s.node, s.new_node)):
                 if not (s.kind in ("stmt", "header") and s.new_node is not None and "lambda" in notes[-1:]):
                     risky = True
@@ -1010,7 +1019,7 @@ def pick_probe(cands, maps):
 EX_TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 OPT_TPCDS = "tests/test_optimizer.py::TestOptimizer::test_tpcds"
 EXECUTION_CODE = ("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/generators/python.py")
-TPCDS_STAGE2 = os.environ.get("BR_TPCDS_STAGE2", "1") == "1"
+TPCDS_STAGE2 = os.environ.get("BR_TPCDS_STAGE2", "0") == "1"  # superseded by the fingerprint stage
 
 
 def tpcds_second_stage(sel, heavy, ms, an, maps, notes):
@@ -1120,10 +1129,24 @@ FP_FILES = ("sqlglot/generators/duckdb.py", "sqlglot/dialects/duckdb.py", "sqlgl
             "sqlglot/typing/duckdb.py", "sqlglot/planner.py")
 
 
-def _fp_file_ok(path):
-    if path in FP_FILES:
+RUNTIME_FILES = ("sqlglot/executor/", "sqlglot/generators/python.py")
+
+
+def touches_executor_runtime(an, maps):
+    """True if any changed statement could run while the executor executes a plan: its enclosing
+    function ran then in the build trace, or it is module/class-level code in a file that did."""
+    if not maps.ex_runtime:
         return True
-    return path.startswith("sqlglot/optimizer/") and path != "sqlglot/optimizer/scope.py"
+    for path in an.changed_py:
+        if path.startswith(RUNTIME_FILES):
+            return True
+    for path, lines in an.site_records:
+        rt = maps.ex_runtime.get(path)
+        if not rt:
+            continue
+        if lines is None or lines & rt:
+            return True
+    return False
 
 
 def tpcds_fingerprint_stage(sel, ms, an, maps, notes):
@@ -1134,7 +1157,8 @@ def tpcds_fingerprint_stage(sel, ms, an, maps, notes):
     ex = maps.by_id.get(EX_TPCDS)
     if not FP_STAGE or ex not in sel or not an.changed_py or not independent(an, maps, {ex}):
         return sel
-    if not all(_fp_file_ok(p) for p in an.changed_py) or not os.path.exists(FP_BASELINE):
+    if touches_executor_runtime(an, maps) or not os.path.exists(FP_BASELINE):
+        notes.append("tpcds-fp-runtime")
         return sel
     if schedule(sel, ms)[1] - schedule(sel - {ex}, ms)[1] < PROBE_MIN_SAVING_MS:
         return sel
@@ -1234,6 +1258,7 @@ def main():
             an.changed_py = {}
             an.other_change = False
             an.other_paths = set()
+            an.site_records = []
             for f in files:
                 sel |= an.analyze_file(f, notes)
             if an.pending:

@@ -6,6 +6,7 @@ Usage: tpcds_fingerprint.py <sqlglot_root> <src_root> [baseline_file]
 With a baseline file: exit 0 if identical, 1 at the first difference. Without: print the fingerprint."""
 import hashlib
 import math
+import pickle
 import sys
 
 root, src = sys.argv[1], sys.argv[2]
@@ -18,9 +19,24 @@ from sqlglot.optimizer import optimize  # noqa: E402
 from sqlglot.schema import ensure_schema  # noqa: E402
 
 
+def edump(e):
+    """Full structure of an expression, including inferred types, which .sql() does not show."""
+    if isinstance(e, exp.Expr):
+        parts = [type(e).__name__]
+        t = getattr(e, "_type", None)
+        if t is not None:
+            parts.append("T=" + t.sql())
+        for k in sorted(e.args):
+            parts.append(k + "=" + edump(e.args[k]))
+        return "(" + " ".join(parts) + ")"
+    if isinstance(e, list):
+        return "[" + ",".join(edump(x) for x in e) + "]"
+    return repr(e)
+
+
 def ser(v, seen):
     if isinstance(v, exp.Expr):
-        return "E:" + type(v).__name__ + ":" + v.sql() + ":" + sub_plans(v, seen)
+        return "E:" + edump(v) + ":" + sub_plans(v, seen)
     if isinstance(v, planner.Step):
         return "S:" + v.name
     if isinstance(v, dict):
@@ -86,8 +102,12 @@ def fingerprints():
         except Exception as ex:  # noqa
             duck = "ERR:" + repr(ex)
         try:
-            optimized = optimize(parse_one(sql), ensure_schema(schema), leave_tables_isolated=True)
-            text = optimized.sql() + "#" + plan_fp(planner.Plan(optimized), set())
+            # the test ships the parsed query to a worker process: same pickle round trip
+            expression = pickle.loads(pickle.dumps(parse_one(sql)))
+            optimized = optimize(expression, ensure_schema(schema), leave_tables_isolated=True)
+            # results come back pickled too; the plan's expressions must survive the same trip
+            optimized = pickle.loads(pickle.dumps(optimized))
+            text = edump(optimized) + "#" + plan_fp(planner.Plan(optimized), set())
         except Exception as ex:  # noqa
             text = "ERR:" + repr(ex)
         yield hashlib.sha1((duck + "\n" + text).encode()).hexdigest()

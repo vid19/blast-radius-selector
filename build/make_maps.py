@@ -201,3 +201,11 @@ if os.path.exists(ic_path):
     raw = json.dumps(out, separators=(",", ":")).encode()
     gzip.open(sys.argv[2], "wb", 9).write(raw)
     print("with import consumers", len(raw) / 1e6)
+
+# ---- lines that run while the executor executes TPC-DS plans (build/runtime_phase.py)
+rt_path = RAW + "ex_runtime_lines.json"
+if os.path.exists(rt_path):
+    out["ex_runtime_lines"] = json.load(open(rt_path))
+    raw = json.dumps(out, separators=(",", ":")).encode()
+    gzip.open(sys.argv[2], "wb", 9).write(raw)
+    print("with executor runtime lines", len(raw) / 1e6)

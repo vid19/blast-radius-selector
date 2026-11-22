@@ -65,10 +65,12 @@ BR_DATA=sample BR_SRC=src python3 selector.py > out.jsonl && python3 score.py sa
    test_generator_memory (6.7 s): the same per-dialect leak check is run here (`genmem_check.py`), only for
    the dialects built from or importing the changed modules (at most 8; shared modules keep the real test).
    On 150 dialect-file mutants it dropped the test 33 times; the real test passed on all 33.
-   Fingerprint stage: for changes confined to the DuckDB dialect files, the planner, or optimizer modules
-   (not scope.py), compare everything the executor's TPC-DS test derives from sqlglot for its 57 executed
-   queries (DuckDB SQL, optimized query, full logical plan incl. dag/leaves/ctes) with a baseline computed
-   in the Docker build. Unchanged means the test cannot change, so it is dropped. 70+ mutants, 0 wrong drops.
+   Fingerprint stage: for changes whose functions never run while the executor executes a plan (traced in the
+   build by build/runtime_phase.py), compare everything the executor's TPC-DS test derives from sqlglot for its 57 executed
+   queries (DuckDB SQL, optimized query after the same pickle round trip the test's worker processes do, full
+   structure incl. inferred types, full logical plan incl. dag/leaves/ctes) with a baseline computed
+   in the Docker build. Unchanged means the test cannot change, so it is dropped. ~110 mutants, 0 wrong drops.
+   (This replaces the optimizer-TPC-DS second stage, which is now off by default.)
    Mixed commits (code plus fixtures/docs): every check still runs when the other changed files are not Python or
    config and none of the tests the check decides about read them (38 mixed mutants: 20 drops, 0 wrong).
 6. Exact runs: for a Python-only change whose candidates are all cheap (estimated CPU × 1.5 below 60% of
