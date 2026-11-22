@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql b/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
+--- a/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
++++ b/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
+@@ -233,7 +233,7 @@
+ -- TPC-DS 3
+ --------------------------------------
+ # execute: true
+-SELECT dt.d_year,
++SELECT DISTINCT dt.d_year,
+                item.i_brand_id          brand_id,
+                item.i_brand             brand,
+                Sum(ss_ext_discount_amt) sum_agg

@@ -209,3 +209,14 @@ if os.path.exists(rt_path):
     raw = json.dumps(out, separators=(",", ":")).encode()
     gzip.open(sys.argv[2], "wb", 9).write(raw)
     print("with executor runtime lines", len(raw) / 1e6)
+
+# ---- which executed TPC-DS queries run each line (build/tpcds_query_cov.py)
+qc_path = RAW + "tpcds_query_cov.json"
+if os.path.exists(qc_path):
+    qc = json.load(open(qc_path))
+    out["tpcds_q"] = {f: {ln: S(qs) for ln, qs in d.items()} for f, d in qc["queries"].items()}
+    out["tpcds_q_setup"] = qc["setup"]
+    out["sets"] = sets
+    raw = json.dumps(out, separators=(",", ":")).encode()
+    gzip.open(sys.argv[2], "wb", 9).write(raw)
+    print("with per-query TPC-DS coverage", len(raw) / 1e6)

@@ -1,0 +1,11 @@
+diff --git a/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql b/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
+--- a/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
++++ b/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
+@@ -596,6 +596,7 @@
+ --------------------------------------
+ -- TPC-DS 5
+ --------------------------------------
++# execute: true
+ WITH ssr AS
+ (
+          SELECT   s_store_id,

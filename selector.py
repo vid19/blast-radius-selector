@@ -171,6 +171,8 @@ class Maps:
         self.import_consumers = m.get("import_consumers", {})
         self.probe_cost = m.get("probe_cost", {"test": {}, "class": {}, "module": {}})
         self.ex_runtime = {k: set(v) for k, v in m.get("ex_runtime_lines", {}).items()}
+        self.tpcds_q = m.get("tpcds_q", {})
+        self.tpcds_q_setup = {k: set(v) for k, v in m.get("tpcds_q_setup", {}).items()}
         self.name_refs = m.get("name_refs", {})
         self.derived = set(m.get("derived", ()))
         self.mapped = set(x for x in remap if x is not None)
@@ -1222,6 +1224,66 @@ def tpcds_subset_stage(sel, ms, an, maps, notes):
     return sel
 
 
+TPCDS_Q_STAGE = os.environ.get("BR_TPCDS_Q", "1") == "1"
+TPCDS_Q_MAX = 6
+
+
+def tpcds_affected_queries(an, maps):
+    """Executed TPC-DS queries whose run touches a changed function, or None if that can't be bounded
+    (module/class-level change, or a changed function also runs while modules import or data loads)."""
+    if not maps.tpcds_q or not an.site_records:
+        return None
+    out = set()
+    for path, lines in an.site_records:
+        if lines is None:
+            return None
+        if lines & maps.tpcds_q_setup.get(path, set()):
+            return None
+        per = maps.tpcds_q.get(path, {})
+        for ln in lines:
+            s = per.get(str(ln))
+            if s is not None:
+                out |= maps.sets[s]
+    return out
+
+
+def tpcds_query_stage(sel, ms, an, maps, notes, run=True):
+    """Drop the executor's TPC-DS test when no executed query runs the changed code, or when replaying
+    just the queries that do (patched code, the test's own logic) passes."""
+    import subprocess
+    ex = maps.by_id.get(EX_TPCDS)
+    if not TPCDS_Q_STAGE or ex not in sel or not an.changed_py or not independent(an, maps, {ex}):
+        return sel
+    affected = tpcds_affected_queries(an, maps)
+    if not run:
+        notes.append("tpcds-q:" + ("unbounded" if affected is None else str(len(affected))))
+    if affected is None:
+        return sel
+    if not affected:
+        notes.append("tpcds-q-none")
+        return sel - {ex}
+    if not run or len(affected) > TPCDS_Q_MAX:
+        return sel
+    if schedule(sel, ms)[1] - schedule(sel - {ex}, ms)[1] < PROBE_MIN_SAVING_MS:
+        return sel
+    fixture = os.path.join(SRC, "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql")
+    try:
+        root = patched_root(an.changed_py)
+        r = subprocess.run([sys.executable, SUBSET_SCRIPT, root, SRC, fixture] + [str(i) for i in sorted(affected)],
+                           capture_output=True, text=True, timeout=20, env=_probe_env(), cwd="/tmp")
+        ok = r.returncode == 0
+    except Exception as e:  # noqa
+        log("tpcds query replay", type(e).__name__)
+        ok = False
+    finally:
+        restore_root(an.changed_py)
+    if ok:
+        notes.append(f"tpcds-q-replay-pass:{len(affected)}")
+        return sel - {ex}
+    notes.append(f"tpcds-q-replay-live:{len(affected)}")
+    return sel
+
+
 def maybe_drop_heavy(sel, ms, an, maps, notes):
     import time
     heavy = {t for t in sel if ms[t] >= HEAVY_MS}
@@ -1322,6 +1384,7 @@ def main():
             try:
                 sel = max_nodes_stage(sel, ms, an, maps, notes)
                 sel = tpcds_subset_stage(sel, ms, an, maps, notes)
+                sel = tpcds_query_stage(sel, ms, an, maps, notes, run=False)
                 sel = genmem_stage(sel, ms, an, maps, notes)
                 if os.environ.get("BR_FP_FIRST", "0") == "1":
                     sel = tpcds_fingerprint_stage(sel, ms, an, maps, notes)
@@ -1329,6 +1392,7 @@ def main():
                 else:
                     sel = maybe_drop_heavy(sel, ms, an, maps, notes)
                     sel = tpcds_fingerprint_stage(sel, ms, an, maps, notes)
+                sel = tpcds_query_stage(sel, ms, an, maps, notes)
                 sel = maybe_exact(sel, ms, an, maps, notes)
             except Exception as e:  # noqa
                 log("probe error", e)
